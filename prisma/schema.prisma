@@ -1,0 +1,227 @@
+// Prisma schema for Job Match ATS Piper
+// Postgres (Supabase). Uses the pooled connection at runtime and the
+// direct connection for migrations, per Supabase + Prisma guidance.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Connection strings live in prisma.config.ts (CLI/migrations) and
+// src/lib/prisma.ts (app runtime, via the @prisma/adapter-pg driver
+// adapter) — Prisma 7 no longer reads `url`/`directUrl` from this block.
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Auth (Auth.js / NextAuth v5 — PrismaAdapter shape)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+
+  // Current credit balance. The source of truth for spend/refund is
+  // CreditTransaction; this column is a denormalized cache kept in sync
+  // atomically by consumeCredits()/grantCredits() (see src/lib/credits.ts).
+  credits Int @default(0)
+
+  // CV Master: the user's canonical resume data, edited in the dashboard
+  // and used as the base input for every tailored generation.
+  cvMaster Json?
+
+  accounts Account[]
+  sessions Session[]
+
+  creditTransactions CreditTransaction[]
+  jobOpportunities   JobOpportunity[]
+  cvTemplates        CVTemplate[]
+  cvGenerations      CVGeneration[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Credits
+// ---------------------------------------------------------------------------
+
+enum CreditTransactionType {
+  PURCHASE // Mercado Pago pack credited via webhook
+  CONSUMPTION // spent on a CV generation
+  REFUND // generation failed after debit, credits returned
+  BONUS // promotional / signup grant
+  ADJUSTMENT // manual admin correction
+}
+
+model CreditTransaction {
+  id     String                @id @default(cuid())
+  userId String
+  user   User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount Int // signed: positive = credit, negative = debit
+  type   CreditTransactionType
+
+  // Resulting balance right after this transaction was applied — lets us
+  // reconstruct/audit history without recomputing a running sum.
+  balanceAfter Int
+
+  reason String?
+
+  relatedGenerationId String?
+  cvGeneration         CVGeneration? @relation(fields: [relatedGenerationId], references: [id])
+
+  relatedPaymentId String? // Mercado Pago payment id, for PURCHASE rows
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("credit_transactions")
+}
+
+// ---------------------------------------------------------------------------
+// Scraping (EPIC 2 target — modeled now so generation can reference it)
+// ---------------------------------------------------------------------------
+
+enum JobPortal {
+  ZONAJOBS
+  BUMERAN
+  LINKEDIN_AR
+  COMPUTRABAJO_AR
+  EMPLEOSIT
+}
+
+model JobOpportunity {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  sourcePortal JobPortal
+  sourceUrl    String
+
+  title          String
+  company        String
+  location       String?
+  descriptionRaw String   @db.Text
+  requirements   String[]
+  keywords       String[]
+
+  scrapedAt DateTime @default(now())
+
+  cvGenerations CVGeneration[]
+
+  @@unique([userId, sourceUrl])
+  @@index([userId])
+  @@map("job_opportunities")
+}
+
+// ---------------------------------------------------------------------------
+// CV templates & generation (EPIC 3 target)
+// ---------------------------------------------------------------------------
+
+model CVTemplate {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  // Raw .typ source with `{{placeholder}}`-style injection points that the
+  // Typst compiler fills in with the LLM-tailored content at generation time.
+  typstSource String @db.Text
+
+  isDefault Boolean @default(false)
+
+  cvGenerations CVGeneration[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("cv_templates")
+}
+
+enum CVGenerationStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model CVGeneration {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  jobOpportunityId String?
+  jobOpportunity   JobOpportunity? @relation(fields: [jobOpportunityId], references: [id])
+
+  templateId String
+  template   CVTemplate @relation(fields: [templateId], references: [id])
+
+  // Immutable snapshots: what the CV Master and LLM output looked like at
+  // generation time, independent of later edits to the live CV Master.
+  cvMasterSnapshot Json
+  tailoredContent  Json?
+
+  pdfUrl String? // signed Supabase Storage URL of the compiled PDF
+
+  status       CVGenerationStatus @default(PENDING)
+  errorMessage String?
+
+  creditsCost Int @default(1)
+
+  creditTransactions CreditTransaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, createdAt])
+  @@map("cv_generations")
+}
